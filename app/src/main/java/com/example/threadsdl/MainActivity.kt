@@ -2,6 +2,8 @@ package com.example.threadsdl // 請再次確認這是您正確的包名
 
 import android.annotation.SuppressLint
 import android.app.DownloadManager
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.net.Uri
 import android.os.Bundle
@@ -15,26 +17,34 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Button
 import android.widget.EditText
+import android.widget.FrameLayout
 import android.widget.ImageButton
 import android.widget.ImageView
 import android.widget.LinearLayout
-import android.widget.ProgressBar
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.recyclerview.widget.RecyclerView
 import com.bumptech.glide.Glide
 import com.google.gson.Gson
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
+import java.io.IOException
 import java.util.concurrent.TimeUnit
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 
 // --- Gson 資料模型 ---
 data class VideoInfo(
-    var videoUrl: String?,
-    var thumbnailUrl: String?,
+    val videoUrl: String?,
+    val thumbnailUrl: String?,
     var duration: Double? = null
 )
 data class JsResult(val postJson: String?)
-data class DurationUpdate(val index: Int, val duration: Double)
 
 data class Post(
     val video_versions: List<VideoVersion>?,
@@ -60,9 +70,11 @@ class MainActivity : AppCompatActivity() {
         private const val TAG = "ThreadsDL_Final"
     }
 
+    // --- UI 元件 ---
     private lateinit var etUrl: EditText
     private lateinit var btnParse: Button
-    private lateinit var progressBar: ProgressBar
+    private lateinit var btnPaste: Button
+    private lateinit var loadingOverlay: FrameLayout
     private lateinit var infoLayout: LinearLayout
     private lateinit var tvDescription: TextView
     private lateinit var ivAuthorProfile: ImageView
@@ -73,9 +85,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var webView: WebView
     private lateinit var videosAdapter: VideosAdapter
     private val gson = Gson()
+    private var parsingJob: Job? = null
     private lateinit var myWebViewClient: MyWebViewClient
-
-    @Volatile private var isDataFound = false
 
     @SuppressLint("SetJavaScriptEnabled", "AddJavascriptInterface")
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -84,7 +95,8 @@ class MainActivity : AppCompatActivity() {
 
         etUrl = findViewById(R.id.etUrl)
         btnParse = findViewById(R.id.btnParse)
-        progressBar = findViewById(R.id.progressBar)
+        btnPaste = findViewById(R.id.btnPaste)
+        loadingOverlay = findViewById(R.id.loadingOverlay)
         infoLayout = findViewById(R.id.infoLayout)
         tvDescription = findViewById(R.id.tvDescription)
         ivAuthorProfile = findViewById(R.id.ivAuthorProfile)
@@ -98,10 +110,14 @@ class MainActivity : AppCompatActivity() {
         btnParse.setOnClickListener {
             val url = etUrl.text.toString().trim()
             if (url.isNotEmpty() && (url.contains("threads.net") || url.contains("threads.com"))) {
-                parseUrlWithWebView(url)
+                startParsingProcess(url)
             } else {
                 Toast.makeText(this, "請輸入有效的 Threads 連結", Toast.LENGTH_SHORT).show()
             }
+        }
+
+        btnPaste.setOnClickListener {
+            pasteFromClipboard()
         }
     }
 
@@ -118,27 +134,106 @@ class MainActivity : AppCompatActivity() {
         webView.settings.javaScriptEnabled = true
         webView.settings.blockNetworkImage = false
         webView.settings.domStorageEnabled = true
-        webView.addJavascriptInterface(JavaScriptInterface(), "AndroidInterface")
+        webView.settings.mediaPlaybackRequiresUserGesture = false
         myWebViewClient = MyWebViewClient()
         webView.webViewClient = myWebViewClient
     }
 
-    private fun injectAdvancedJavascript(targetUsername: String) {
-        val jsCode = """
+    private fun startParsingProcess(url: String) {
+        parsingJob?.cancel()
+        parsingJob = CoroutineScope(Dispatchers.Main).launch {
+            loadingOverlay.visibility = View.VISIBLE
+            infoLayout.visibility = View.GONE
+            videosAdapter.submitList(emptyList())
+
+            val startTime = System.currentTimeMillis()
+            val result = withTimeoutOrNull(12000L) {
+                parseWithWebView(url)
+            }
+
+            val elapsedTime = System.currentTimeMillis() - startTime
+            val remainingDelay = 5000L - elapsedTime
+            if (remainingDelay > 0) {
+                delay(remainingDelay)
+            }
+
+            loadingOverlay.visibility = View.GONE
+
+            if (result != null) {
+                updateUiWithResult(result)
+            } else {
+                webView.stopLoading()
+                Toast.makeText(this@MainActivity, "解析超時，請檢查網路或連結", Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+
+    private suspend fun parseWithWebView(url: String): JsResult =
+        kotlinx.coroutines.suspendCancellableCoroutine { continuation ->
+            var isFinished = false
+
+            val jsInterface = object {
+                @JavascriptInterface
+                fun onDataFound(jsonData: String) {
+                    if (!isFinished) {
+                        isFinished = true
+                        val result = gson.fromJson(jsonData, JsResult::class.java)
+                        if (continuation.isActive) {
+                            continuation.resume(result)
+                        }
+                    }
+                }
+
+                @JavascriptInterface
+                fun onDataNotFound(reason: String) {
+                    if (!isFinished) {
+                        isFinished = true
+                        Log.e(TAG, "JS 找不到資料: $reason")
+                        if (continuation.isActive) {
+                            continuation.resumeWithException(IOException(reason))
+                        }
+                    }
+                }
+            }
+
+            runOnUiThread {
+                webView.addJavascriptInterface(jsInterface, "AndroidInterface")
+                myWebViewClient.setCurrentTargetUrl(url) { targetUsername ->
+                    if (!isFinished) {
+                        injectJavascript(targetUsername)
+                    }
+                }
+                webView.loadUrl("about:blank")
+                webView.loadUrl(url)
+            }
+
+            continuation.invokeOnCancellation {
+                runOnUiThread {
+                    webView.stopLoading()
+                }
+            }
+        }
+
+    private fun injectJavascript(targetUsername: String) {
+        val jsCode = getJsToExecute(targetUsername)
+        webView.evaluateJavascript(jsCode, null)
+    }
+
+    private fun getJsToExecute(targetUsername: String): String {
+        return """
             (function() {
                 function findObjectWithKeys(obj, keys) {
                     if (obj !== null && typeof obj === 'object') {
-                        var hasAllKeys = keys.every(key => obj.hasOwnProperty(key));
-                        if (hasAllKeys) { return obj; }
+                        if (keys.every(key => obj.hasOwnProperty(key))) return obj;
                         for (var k in obj) {
                             var result = findObjectWithKeys(obj[k], keys);
-                            if (result) { return result; }
+                            if (result) return result;
                         }
                     }
                     return null;
                 }
                 var attempts = 0;
-                var maxAttempts = 20;
+                var maxAttempts = 22;
                 var targetUsername = "$targetUsername";
                 
                 var interval = setInterval(function() {
@@ -160,157 +255,76 @@ class MainActivity : AppCompatActivity() {
                         }
                     });
                     
-                    if (!found) {
-                        attempts++;
-                        if (attempts >= maxAttempts) {
-                            clearInterval(interval);
-                            AndroidInterface.onDataNotFound("找不到作者 '" + targetUsername + "' 的貼文資料");
-                        }
+                    if (!found && ++attempts >= maxAttempts) {
+                        clearInterval(interval);
+                        AndroidInterface.onDataNotFound("找不到作者 '" + targetUsername + "' 的貼文資料");
                     }
                 }, 500);
             })();
-        """.trimIndent()
-
-        webView.evaluateJavascript(jsCode, null)
+        """
     }
 
-    inner class JavaScriptInterface {
-        @JavascriptInterface
-        fun onDataFound(jsonData: String) {
-            if (isDataFound) return
-            isDataFound = true
+    private fun updateUiWithResult(result: JsResult) {
+        try {
+            val post = gson.fromJson(result.postJson, Post::class.java)
+            var videos: MutableList<VideoInfo> = mutableListOf()
+            var postType = "unknown"
 
-            try {
-                val jsResult = gson.fromJson(jsonData, JsResult::class.java)
-                val post = gson.fromJson(jsResult.postJson, Post::class.java)
-
-                var videos: MutableList<VideoInfo> = mutableListOf()
-                var postType = "unknown"
-
-                if (!post.carousel_media.isNullOrEmpty()) {
-                    post.carousel_media.forEach { media ->
-                        if (!media.video_versions.isNullOrEmpty()) {
-                            if (postType == "unknown") postType = "video"
-                            videos.add(VideoInfo(
-                                videoUrl = media.video_versions.first().url,
-                                thumbnailUrl = media.image_versions2?.candidates?.firstOrNull()?.url,
-                                duration = null
-                            ))
-                        }
-                    }
-                }
-
-                if (videos.isEmpty() && !post.video_versions.isNullOrEmpty()) {
-                    postType = "video"
-                    videos.add(VideoInfo(
-                        videoUrl = post.video_versions.first().url,
-                        thumbnailUrl = post.image_versions2?.candidates?.firstOrNull()?.url,
-                        duration = null
-                    ))
-                }
-
-                if (postType == "unknown" && post.image_versions2 != null) {
-                    postType = "image"
-                }
-
-                runOnUiThread {
-                    progressBar.visibility = View.GONE
-                    btnParse.isEnabled = true
-
-                    tvDescription.text = post.caption?.text.takeIf { !it.isNullOrBlank() } ?: "（沒有描述）"
-                    Glide.with(this@MainActivity).load(post.user?.profile_pic_url).circleCrop().into(ivAuthorProfile)
-                    tvAuthorUsername.text = post.user?.username
-
-                    when (postType) {
-                        "video" -> {
-                            tvPostTypeMessage.visibility = View.GONE
-                            rvVideos.visibility = View.VISIBLE
-                            videosAdapter.submitList(videos)
-                        }
-                        "image" -> {
-                            rvVideos.visibility = View.GONE
-                            tvPostTypeMessage.text = "這是一則圖片貼文，無法下載影片。"
-                            tvPostTypeMessage.visibility = View.VISIBLE
-                        }
-                        else -> {
-                            rvVideos.visibility = View.GONE
-                            tvPostTypeMessage.visibility = View.VISIBLE
-                            tvPostTypeMessage.text = "找不到可下載的內容"
-                        }
-                    }
-                    infoLayout.visibility = View.VISIBLE
-                }
-
-            } catch (e: Exception) {
-                Log.e(TAG, "處理回傳資料時出錯", e)
-                onDataNotFound("解析回傳的資料時出錯")
-            }
-        }
-
-        @JavascriptInterface
-        fun onDataNotFound(reason: String) {
-            if (isDataFound) return
-
-            runOnUiThread {
-                Toast.makeText(this@MainActivity, "解析失敗：$reason", Toast.LENGTH_LONG).show()
-                progressBar.visibility = View.GONE
-                btnParse.isEnabled = true
-            }
-        }
-    }
-
-    inner class MyWebViewClient : WebViewClient() {
-        private var currentTargetUrl: String? = null
-
-        fun setCurrentTargetUrl(url: String) {
-            this.currentTargetUrl = url
-        }
-
-        override fun onPageFinished(view: WebView?, url: String?) {
-            super.onPageFinished(view, url)
-
-            if (url != null && url == currentTargetUrl && !isDataFound) {
-                Log.d(TAG, "目標 WebView 頁面載入完成: $url")
-
-                val targetUsername = url.substringAfter("/@").substringBefore("/")
-                if (targetUsername.isNotBlank()) {
-                    injectAdvancedJavascript(targetUsername)
-                } else {
-                    Log.e(TAG, "無法從 URL 中提取有效的用户名: $url")
-                    runOnUiThread {
-                        Toast.makeText(this@MainActivity, "解析失敗：連結格式不正確", Toast.LENGTH_LONG).show()
-                        progressBar.visibility = View.GONE
-                        btnParse.isEnabled = true
+            if (!post.carousel_media.isNullOrEmpty()) {
+                post.carousel_media.forEach { media ->
+                    if (!media.video_versions.isNullOrEmpty()) {
+                        if (postType == "unknown") postType = "video"
+                        videos.add(VideoInfo(
+                            videoUrl = media.video_versions.first().url,
+                            thumbnailUrl = media.image_versions2?.candidates?.firstOrNull()?.url
+                        ))
                     }
                 }
             }
+            if (videos.isEmpty() && !post.video_versions.isNullOrEmpty()) {
+                postType = "video"
+                videos.add(VideoInfo(
+                    videoUrl = post.video_versions.first().url,
+                    thumbnailUrl = post.image_versions2?.candidates?.firstOrNull()?.url
+                ))
+            }
+            if (postType == "unknown" && post.image_versions2 != null) {
+                postType = "image"
+            }
+
+            tvDescription.text = post.caption?.text.takeIf { !it.isNullOrBlank() } ?: "（沒有描述）"
+            Glide.with(this@MainActivity).load(post.user?.profile_pic_url).circleCrop().into(ivAuthorProfile)
+            tvAuthorUsername.text = post.user?.username
+
+            when (postType) {
+                "video" -> {
+                    tvPostTypeMessage.visibility = View.GONE
+                    rvVideos.visibility = View.VISIBLE
+                    videosAdapter.submitList(videos)
+                }
+                "image" -> {
+                    rvVideos.visibility = View.GONE
+                    tvPostTypeMessage.text = "這是一則圖片貼文，無法下載影片。"
+                    tvPostTypeMessage.visibility = View.VISIBLE
+                }
+                else -> {
+                    rvVideos.visibility = View.GONE
+                    tvPostTypeMessage.visibility = View.VISIBLE
+                    tvPostTypeMessage.text = "找不到可下載的內容"
+                }
+            }
+            infoLayout.visibility = View.VISIBLE
+        } catch (e: Exception) {
+            Log.e(TAG, "更新 UI 時出錯", e)
+            Toast.makeText(this, "處理資料時發生錯誤", Toast.LENGTH_SHORT).show()
         }
     }
 
-
-    private fun parseUrlWithWebView(url: String) {
-        isDataFound = false
-
-        progressBar.visibility = View.VISIBLE
-        infoLayout.visibility = View.GONE
-        btnParse.isEnabled = false
-        videosAdapter.submitList(emptyList())
-
-        myWebViewClient.setCurrentTargetUrl(url)
-        webView.loadUrl("about:blank")
-        webView.loadUrl(url)
-    }
-
-    private fun formatDuration(seconds: Double?): String {
-        // --- 修正點：使用局部變數來解決 Smart Cast 問題 ---
-        val duration = seconds ?: return ""
-        if (duration.isNaN() || duration.isInfinite()) {
-            return ""
+    private fun pasteFromClipboard() {
+        val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        clipboard.primaryClip?.getItemAt(0)?.text?.let {
+            etUrl.setText(it)
         }
-        val totalSeconds = duration.toLong()
-        val minutes = TimeUnit.SECONDS.toMinutes(totalSeconds)
-        val remainingSeconds = totalSeconds - TimeUnit.MINUTES.toSeconds(minutes)
-        return String.format("%02d:%02d", minutes, remainingSeconds)
     }
 
     private fun startDownload(url: String) {
@@ -340,6 +354,26 @@ class MainActivity : AppCompatActivity() {
         super.onDestroy()
     }
 
+    inner class MyWebViewClient : WebViewClient() {
+        private var currentTargetUrl: String? = null
+        private var onUrlLoaded: ((String) -> Unit)? = null
+
+        fun setCurrentTargetUrl(url: String, onLoaded: (String) -> Unit) {
+            this.currentTargetUrl = url
+            this.onUrlLoaded = onLoaded
+        }
+
+        override fun onPageFinished(view: WebView?, url: String?) {
+            super.onPageFinished(view, url)
+            if (url != null && url == currentTargetUrl) {
+                val targetUsername = url.substringAfter("/@").substringBefore("/")
+                if (targetUsername.isNotBlank()) {
+                    onUrlLoaded?.invoke(targetUsername)
+                }
+            }
+        }
+    }
+
     inner class VideosAdapter(private val onDownloadClick: (String) -> Unit) : RecyclerView.Adapter<VideosAdapter.VideoViewHolder>() {
         private var videoList = mutableListOf<VideoInfo>()
         private val downloadedUrls = mutableSetOf<String>()
@@ -352,13 +386,6 @@ class MainActivity : AppCompatActivity() {
                 videoList.addAll(newList)
             }
             notifyDataSetChanged()
-        }
-
-        fun updateDuration(index: Int, duration: Double) {
-            if (index >= 0 && index < videoList.size) {
-                videoList[index].duration = duration
-                notifyItemChanged(index)
-            }
         }
 
         fun addDownloadedUrl(url: String) {
@@ -374,7 +401,6 @@ class MainActivity : AppCompatActivity() {
             val view = LayoutInflater.from(parent.context).inflate(R.layout.item_video, parent, false)
             return VideoViewHolder(view)
         }
-
 
         override fun onBindViewHolder(holder: VideoViewHolder, position: Int) {
             val videoInfo = videoList[position]
@@ -396,16 +422,15 @@ class MainActivity : AppCompatActivity() {
                     .error(android.R.drawable.stat_notify_error)
                     .into(thumbnail)
 
-                // --- 修正點：使用局部變數來解決 Smart Cast 問題 ---
-                val currentDuration = videoInfo.duration
-                duration.text = formatDuration(currentDuration)
-                duration.visibility = if (currentDuration != null && currentDuration > 0) View.VISIBLE else View.GONE
+                duration.visibility = View.GONE
 
                 if (isDownloaded) {
+                    thumbnail.alpha = 0.5f
                     downloadButton.setImageResource(android.R.drawable.stat_sys_download_done)
                     downloadButton.alpha = 0.5f
                     downloadButton.isEnabled = false
                 } else {
+                    thumbnail.alpha = 1.0f
                     downloadButton.setImageResource(android.R.drawable.stat_sys_download)
                     downloadButton.alpha = 1.0f
                     downloadButton.isEnabled = true
